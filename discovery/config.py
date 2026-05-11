@@ -23,19 +23,17 @@ IG_HASHTAGS = [
 ]
 
 TT_HASHTAGS = [
-    # from SOP
+    # Strong PL-only seeds — used both for scraping AND to mark users as
+    # PL-trusted in the discovery short-circuit. Weak/internationally
+    # ambiguous tags (marketing, motywacja, nauka, produktywnosc) are not
+    # included: in the v1 run they pulled in too many non-PL creators.
     "biznes",
-    "marketing",
     "copywriting",
     "edutok",
-    "nauka",
     "rozwojosobisty",
-    # extensions
     "edukacjapl",
     "storytime",
     "opowiadania",
-    "produktywnosc",
-    "motywacja",
     "fitnesspolska",
 ]
 

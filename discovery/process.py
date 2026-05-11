@@ -82,6 +82,7 @@ class CreatorRow:
     avg_views: float | None
     profile_url: str
     discovered_via_pl_hashtag: bool = False
+    captions_blob: str = ""  # joined captions/texts from recent videos for PL detection
     reject_reasons: list[str] = field(default_factory=list)
 
 
@@ -133,6 +134,16 @@ def build_tt_hashtag_map(videos: list[dict]) -> dict[str, set[str]]:
         if not author:
             continue
         hashtags: set[str] = set()
+        # clockworks/tiktok-scraper records the exact seed that pulled the
+        # video in via `searchHashtag` — most reliable PL-trust signal.
+        sh = vid.get("searchHashtag")
+        if isinstance(sh, dict):
+            sh = sh.get("name") or sh.get("hashtag")
+        if isinstance(sh, str):
+            hashtags.add(sh.lstrip("#").lower())
+        inp = vid.get("input")
+        if isinstance(inp, str):
+            hashtags.add(inp.lstrip("#").lower())
         for tag in vid.get("hashtags") or []:
             name = tag.get("name") if isinstance(tag, dict) else tag
             if isinstance(name, str):
@@ -206,6 +217,24 @@ def parse_ig_profile(profile: dict, pl_hashtag_users: dict[str, set[str]]) -> Cr
     )
 
 
+def aggregate_tt_per_video(items: list[dict]) -> list[dict]:
+    """clockworks/tiktok-scraper returns one item per video even when run
+    against profile usernames. Group by author into pseudo-profile dicts so
+    parse_tt_profile can consume them."""
+    by_author: dict[str, dict] = {}
+    for it in items:
+        author = it.get("authorMeta") or {}
+        name = (author.get("name") or author.get("uniqueId") or "").strip().lower()
+        if not name:
+            continue
+        entry = by_author.get(name)
+        if entry is None:
+            entry = {"authorMeta": author, "posts": []}
+            by_author[name] = entry
+        entry["posts"].append(it)
+    return list(by_author.values())
+
+
 def parse_tt_profile(profile: dict, pl_hashtag_users: dict[str, set[str]]) -> CreatorRow | None:
     # Apify TT profile scraper nests author info under various keys depending on actor
     author = profile.get("authorMeta") or profile.get("user") or profile
@@ -220,6 +249,10 @@ def parse_tt_profile(profile: dict, pl_hashtag_users: dict[str, set[str]]) -> Cr
         ts = _parse_ts(p.get("createTime") or p.get("createTimeISO") or p.get("timestamp"))
         if ts and ts >= cutoff:
             recent.append({**p, "_ts": ts})
+
+    # Captions blob — aggregate text from ALL fetched videos (not just recent)
+    # so we have language signal even for less-active creators.
+    captions_blob = " ".join((p.get("text") or "") for p in posts)[:8000]
 
     if recent:
         top = max(recent, key=lambda r: r.get("playCount") or r.get("views") or 0)
@@ -253,6 +286,7 @@ def parse_tt_profile(profile: dict, pl_hashtag_users: dict[str, set[str]]) -> Cr
         avg_views=avg_views,
         profile_url=f"https://www.tiktok.com/@{handle}",
         discovered_via_pl_hashtag=handle.lower() in pl_hashtag_users,
+        captions_blob=captions_blob,
     )
 
 
@@ -278,8 +312,14 @@ def apply_filters(row: CreatorRow) -> bool:
         row.reject_reasons.append(f"followers={row.followers}")
     if row.reels_30d < MIN_REELS_30D:
         row.reject_reasons.append(f"reels_30d={row.reels_30d}")
-    # PL: bio diacritics/stopwords OR discovered via PL hashtag (user choice)
-    if not (looks_polish(row.bio) or row.discovered_via_pl_hashtag):
+    # PL detection — bio is the strongest signal. For TT the bio is often empty
+    # or in English; fall back to video captions where the creator's actual
+    # content language shows up. IG falls back to PL-hashtag discovery (their
+    # captions aren't enriched by the profile scraper).
+    pl_signal = looks_polish(row.bio) or looks_polish(row.captions_blob)
+    if row.platform == "IG":
+        pl_signal = pl_signal or row.discovered_via_pl_hashtag
+    if not pl_signal:
         row.reject_reasons.append("not_pl")
     if row.is_verified:
         row.reject_reasons.append("verified")
@@ -386,10 +426,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         log.warning("IG: need both --ig-hashtag-posts and --ig-profiles, skipping")
 
     if args.tt_hashtag_posts and args.tt_profiles:
+        tt_profile_items = _load_json(args.tt_profiles)
+        if tt_profile_items and "posts" not in tt_profile_items[0] and "videos" not in tt_profile_items[0]:
+            log.info("TT: detected per-video shape, aggregating by author")
+            tt_profile_items = aggregate_tt_per_video(tt_profile_items)
         passed, rejected = process_platform(
             "TT",
             _load_json(args.tt_hashtag_posts),
-            _load_json(args.tt_profiles),
+            tt_profile_items,
             parse_tt_profile,
             build_tt_hashtag_map,
         )
